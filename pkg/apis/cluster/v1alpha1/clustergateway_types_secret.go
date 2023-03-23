@@ -6,6 +6,9 @@ import (
 	"strconv"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/utils/pointer"
+
 	"github.com/oam-dev/cluster-gateway/pkg/common"
 	"github.com/oam-dev/cluster-gateway/pkg/config"
 	"github.com/oam-dev/cluster-gateway/pkg/featuregates"
@@ -29,9 +32,10 @@ var _ rest.Getter = &ClusterGateway{}
 var _ rest.Lister = &ClusterGateway{}
 
 // Conversion between corev1.Secret and ClusterGateway:
-//   1. Storing credentials under the secret's data including X.509 key-pair or token.
-//   2. Extending the spec of ClusterGateway by the secret's label.
-//   3. Extending the status of ClusterGateway by the secrets' annotation.
+//  1. Storing credentials under the secret's data including X.509 key-pair or token.
+//  2. Extending the spec of ClusterGateway by the secret's label.
+//  3. Extending the status of ClusterGateway by the secrets' annotation.
+//
 // NOTE: Because the secret resource is designed to have no "metadata.generation" field,
 // the ClusterGateway resource also misses the generation tracking.
 const (
@@ -40,6 +44,10 @@ const (
 )
 
 func (in *ClusterGateway) Get(ctx context.Context, name string, _ *metav1.GetOptions) (runtime.Object, error) {
+	if singleton.GetSecretControl() == nil {
+		return nil, fmt.Errorf("loopback secret client are not inited")
+	}
+
 	clusterSecret, err := singleton.GetSecretControl().Get(ctx, name)
 	if err != nil {
 		klog.Warningf("Failed getting secret %q/%q: %v", config.SecretNamespace, name, err)
@@ -47,12 +55,12 @@ func (in *ClusterGateway) Get(ctx context.Context, name string, _ *metav1.GetOpt
 	}
 
 	if options.OCMIntegration {
-		managedCluster, err := singleton.GetOCMClient().
-			ClusterV1().
-			ManagedClusters().
-			Get(ctx, name, metav1.GetOptions{})
+		if singleton.GetClusterControl() == nil {
+			return nil, fmt.Errorf("loopback cluster client are not inited")
+		}
+		managedCluster, err := singleton.GetClusterControl().Get(ctx, name)
 		if err != nil {
-			return nil, err
+			return convertFromSecret(clusterSecret)
 		}
 		return convertFromManagedClusterAndSecret(managedCluster, clusterSecret)
 	}
@@ -74,18 +82,15 @@ func (in *ClusterGateway) List(ctx context.Context, opt *internalversion.ListOpt
 	}
 
 	if options.OCMIntegration {
-		clusters, err := singleton.GetOCMClient().
-			ClusterV1().
-			ManagedClusters().
-			List(context.TODO(), metav1.ListOptions{})
+		clusters, err := singleton.GetClusterControl().List(ctx)
 		if err != nil {
 			return nil, err
 		}
 		clustersByName := make(map[string]*clusterv1.ManagedCluster)
-		for _, cluster := range clusters.Items {
-			cluster := cluster
-			clustersByName[cluster.Name] = &cluster
+		for _, cluster := range clusters {
+			clustersByName[cluster.Name] = cluster
 		}
+
 		for _, secret := range clusterSecrets {
 			if cluster, ok := clustersByName[secret.Name]; ok {
 				gw, err := convertFromManagedClusterAndSecret(cluster, secret)
@@ -250,6 +255,18 @@ func convert(caData []byte, apiServerEndpoint string, insecure bool, secret *v1.
 		}
 		if healthyReason, ok := secret.Annotations[AnnotationKeyClusterGatewayStatusHealthyReason]; ok {
 			c.Status.HealthyReason = HealthyReasonType(healthyReason)
+		}
+	}
+
+	if utilfeature.DefaultMutableFeatureGate.Enabled(featuregates.ClientIdentityPenetration) {
+		if proxyConfigRaw, ok := secret.Annotations[AnnotationClusterGatewayProxyConfiguration]; ok {
+			proxyConfig := &ClusterGatewayProxyConfiguration{}
+			if err := yaml.Unmarshal([]byte(proxyConfigRaw), proxyConfig); err == nil {
+				for _, rule := range proxyConfig.Spec.Rules {
+					rule.Source.Cluster = pointer.String(c.Name)
+				}
+				c.Spec.ProxyConfig = proxyConfig
+			}
 		}
 	}
 

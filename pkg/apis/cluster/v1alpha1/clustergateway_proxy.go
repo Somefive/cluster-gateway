@@ -21,21 +21,26 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	gopath "path"
+	"regexp"
 	"strings"
 	"time"
 
+	"k8s.io/apiserver/pkg/server"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/klog/v2"
+	"k8s.io/utils/strings/slices"
+
 	"github.com/oam-dev/cluster-gateway/pkg/config"
+	"github.com/oam-dev/cluster-gateway/pkg/featuregates"
 	"github.com/oam-dev/cluster-gateway/pkg/metrics"
 
 	"github.com/pkg/errors"
-	v1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	apiproxy "k8s.io/apimachinery/pkg/util/proxy"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/apiserver/pkg/apis/audit"
-	"k8s.io/apiserver/pkg/audit/event"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/endpoints/handlers/responsewriters"
 	"k8s.io/apiserver/pkg/endpoints/request"
@@ -84,7 +89,11 @@ func (c *ClusterGatewayProxy) New() runtime.Object {
 	return &ClusterGatewayProxyOptions{}
 }
 
+func (in *ClusterGatewayProxy) Destroy() {}
+
 func (c *ClusterGatewayProxy) Connect(ctx context.Context, id string, options runtime.Object, r registryrest.Responder) (http.Handler, error) {
+	ts := time.Now()
+
 	proxyOpts, ok := options.(*ClusterGatewayProxyOptions)
 	if !ok {
 		return nil, fmt.Errorf("invalid options object: %#v", options)
@@ -117,33 +126,23 @@ func (c *ClusterGatewayProxy) Connect(ctx context.Context, id string, options ru
 		user, _ := request.UserFrom(ctx)
 		var attr authorizer.Attributes
 		if proxyReqInfo.IsResourceRequest {
-			attr, _ = event.NewAttributes(&audit.Event{
-				User: v1.UserInfo{
-					Username: user.GetName(),
-					UID:      user.GetUID(),
-					Groups:   user.GetGroups(),
-				},
-				ObjectRef: &audit.ObjectReference{
-					APIGroup:    proxyReqInfo.APIGroup,
-					APIVersion:  proxyReqInfo.APIVersion,
-					Resource:    proxyReqInfo.Resource,
-					Subresource: proxyReqInfo.Subresource,
-					Namespace:   proxyReqInfo.Namespace,
-					Name:        proxyReqInfo.Name,
-				},
-				Verb: proxyReqInfo.Verb,
-			})
+			attr = authorizer.AttributesRecord{
+				User:        user,
+				APIGroup:    proxyReqInfo.APIGroup,
+				APIVersion:  proxyReqInfo.APIVersion,
+				Resource:    proxyReqInfo.Resource,
+				Subresource: proxyReqInfo.Subresource,
+				Namespace:   proxyReqInfo.Namespace,
+				Name:        proxyReqInfo.Name,
+				Verb:        proxyReqInfo.Verb,
+			}
 		} else {
-			attr, _ = event.NewAttributes(&audit.Event{
-				User: v1.UserInfo{
-					Username: user.GetName(),
-					UID:      user.GetUID(),
-					Groups:   user.GetGroups(),
-				},
-				ObjectRef:  nil,
-				RequestURI: proxyReqInfo.Path,
-				Verb:       proxyReqInfo.Verb,
-			})
+			path, _ := url.ParseRequestURI(proxyReqInfo.Path)
+			attr = authorizer.AttributesRecord{
+				User: user,
+				Path: path.Path,
+				Verb: proxyReqInfo.Verb,
+			}
 		}
 
 		decision, reason, err := loopback.GetAuthorizer().Authorize(ctx, attr)
@@ -164,6 +163,7 @@ func (c *ClusterGatewayProxy) Connect(ctx context.Context, id string, options ru
 		finishFunc: func(code int) {
 			metrics.RecordProxiedRequestsByResource(proxyReqInfo.Resource, proxyReqInfo.Verb, code)
 			metrics.RecordProxiedRequestsByCluster(id, code)
+			metrics.RecordProxiedRequestsDuration(proxyReqInfo.Resource, proxyReqInfo.Verb, id, code, time.Since(ts))
 		},
 	}, nil
 }
@@ -200,15 +200,39 @@ var (
 	apiSuffix = "/proxy"
 )
 
-func (p *proxyHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+type proxyResponseWriter struct {
+	http.ResponseWriter
+	http.Hijacker
+	http.Flusher
+	statusCode int
+}
+
+func (in *proxyResponseWriter) WriteHeader(statusCode int) {
+	in.statusCode = statusCode
+	in.ResponseWriter.WriteHeader(statusCode)
+}
+
+func newProxyResponseWriter(_writer http.ResponseWriter) *proxyResponseWriter {
+	writer := &proxyResponseWriter{ResponseWriter: _writer, statusCode: http.StatusOK}
+	writer.Hijacker, _ = _writer.(http.Hijacker)
+	writer.Flusher, _ = _writer.(http.Flusher)
+	return writer
+}
+
+func (p *proxyHandler) ServeHTTP(_writer http.ResponseWriter, request *http.Request) {
+	writer := newProxyResponseWriter(_writer)
+	defer func() {
+		p.finishFunc(writer.statusCode)
+	}()
 	cluster := p.clusterGateway
 	if cluster.Spec.Access.Credential == nil {
 		responsewriters.InternalError(writer, request, fmt.Errorf("proxying cluster %s not support due to lacking credentials", cluster.Name))
 		return
 	}
 
-	// WithContext creates a shallow clone of the request with the same context.
-	newReq := request.WithContext(request.Context())
+	// Go 1.19 removes the URL clone in WithContext method and therefore change
+	// to deep copy here
+	newReq := request.Clone(request.Context())
 	newReq.Header = utilnet.CloneHeader(request.Header)
 	newReq.URL.Path = p.path
 
@@ -220,8 +244,8 @@ func (p *proxyHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 	host, _, _ := net.SplitHostPort(urlAddr.Host)
 	path := strings.TrimPrefix(request.URL.Path, apiPrefix+p.parentName+apiSuffix)
 	newReq.Host = host
-	newReq.URL.Path = path
-	newReq.URL.RawQuery = request.URL.RawQuery
+	newReq.URL.Path = gopath.Join(urlAddr.Path, path)
+	newReq.URL.RawQuery = unescapeQueryValues(request.URL.Query()).Encode()
 	newReq.RequestURI = newReq.URL.RequestURI()
 
 	cfg, err := NewConfigFromCluster(request.Context(), cluster)
@@ -229,8 +253,8 @@ func (p *proxyHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 		responsewriters.InternalError(writer, request, errors.Wrapf(err, "failed creating cluster proxy client config %s", cluster.Name))
 		return
 	}
-	if p.impersonate {
-		cfg.Impersonate = getImpersonationConfig(request)
+	if p.impersonate || utilfeature.DefaultFeatureGate.Enabled(featuregates.ClientIdentityPenetration) {
+		cfg.Impersonate = p.getImpersonationConfig(request)
 	}
 	rt, err := restclient.TransportFor(cfg)
 	if err != nil {
@@ -240,7 +264,7 @@ func (p *proxyHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 	proxy := apiproxy.NewUpgradeAwareHandler(
 		&url.URL{
 			Scheme:   urlAddr.Scheme,
-			Path:     path,
+			Path:     newReq.URL.Path,
 			Host:     urlAddr.Host,
 			RawQuery: request.URL.RawQuery,
 		},
@@ -311,11 +335,81 @@ func (e ErrorResponderFunc) Error(w http.ResponseWriter, req *http.Request, err 
 	e(w, req, err)
 }
 
-func getImpersonationConfig(req *http.Request) restclient.ImpersonationConfig {
+func (p *proxyHandler) getImpersonationConfig(req *http.Request) restclient.ImpersonationConfig {
 	user, _ := request.UserFrom(req.Context())
+	if p.clusterGateway.Spec.ProxyConfig != nil {
+		matched, ruleName, projected, err := ExchangeIdentity(&p.clusterGateway.Spec.ProxyConfig.Spec.ClientIdentityExchanger, user, p.parentName)
+		if err != nil {
+			klog.Errorf("exchange identity with cluster config error: %w", err)
+		}
+		if matched {
+			klog.Infof("identity exchanged with rule `%s` in the proxy config from cluster `%s`", ruleName, p.clusterGateway.Name)
+			return *projected
+		}
+	}
+	matched, ruleName, projected, err := ExchangeIdentity(&GlobalClusterGatewayProxyConfiguration.Spec.ClientIdentityExchanger, user, p.parentName)
+	if err != nil {
+		klog.Errorf("exchange identity with global config error: %w", err)
+	}
+	if matched {
+		klog.Infof("identity exchanged with rule `%s` in the proxy config from global config", ruleName)
+		return *projected
+	}
 	return restclient.ImpersonationConfig{
 		UserName: user.GetName(),
 		Groups:   user.GetGroups(),
 		Extra:    user.GetExtra(),
 	}
+}
+
+// NewClusterGatewayProxyRequestEscaper wrap the base http.Handler and escape
+// the dryRun parameter. Otherwise, the dryRun request will be blocked by
+// apiserver middlewares
+func NewClusterGatewayProxyRequestEscaper(delegate http.Handler) http.Handler {
+	return &clusterGatewayProxyRequestEscaper{delegate: delegate}
+}
+
+type clusterGatewayProxyRequestEscaper struct {
+	delegate http.Handler
+}
+
+var (
+	clusterGatewayProxyPathPattern = regexp.MustCompile(strings.Join([]string{
+		server.APIGroupPrefix,
+		config.MetaApiGroupName,
+		config.MetaApiVersionName,
+		"clustergateways",
+		"[a-z0-9]([-a-z0-9]*[a-z0-9])?",
+		"proxy"}, "/"))
+	clusterGatewayProxyQueryKeysToEscape = []string{"dryRun"}
+	clusterGatewayProxyEscaperPrefix     = "__"
+)
+
+func (in *clusterGatewayProxyRequestEscaper) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if clusterGatewayProxyPathPattern.MatchString(req.URL.Path) {
+		newReq := req.Clone(req.Context())
+		q := req.URL.Query()
+		for _, k := range clusterGatewayProxyQueryKeysToEscape {
+			if q.Has(k) {
+				q.Set(clusterGatewayProxyEscaperPrefix+k, q.Get(k))
+				q.Del(k)
+			}
+		}
+		newReq.URL.RawQuery = q.Encode()
+		req = newReq
+	}
+	in.delegate.ServeHTTP(w, req)
+}
+
+func unescapeQueryValues(values url.Values) url.Values {
+	unescaped := url.Values{}
+	for k, vs := range values {
+		if strings.HasPrefix(k, clusterGatewayProxyEscaperPrefix) &&
+			slices.Contains(clusterGatewayProxyQueryKeysToEscape,
+				strings.TrimPrefix(k, clusterGatewayProxyEscaperPrefix)) {
+			k = strings.TrimPrefix(k, clusterGatewayProxyEscaperPrefix)
+		}
+		unescaped[k] = vs
+	}
+	return unescaped
 }

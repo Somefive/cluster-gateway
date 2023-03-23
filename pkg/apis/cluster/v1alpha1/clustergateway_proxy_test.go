@@ -2,9 +2,10 @@ package v1alpha1
 
 import (
 	"context"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	gopath "path"
 	"strings"
 	"testing"
 
@@ -14,9 +15,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/util/feature"
+	clientgorest "k8s.io/client-go/rest"
 	"k8s.io/component-base/featuregate"
 	k8stesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/utils/pointer"
@@ -31,6 +34,9 @@ func TestProxyHandler(t *testing.T) {
 		objName         string
 		inputOption     *ClusterGatewayProxyOptions
 		reqInfo         request.RequestInfo
+		query           string
+		expectedQuery   string
+		endpointPath    string
 		expectedFailure bool
 		errorAssertFunc func(t *testing.T, err error)
 	}{
@@ -76,6 +82,59 @@ func TestProxyHandler(t *testing.T) {
 				assert.True(t, strings.HasPrefix(err.Error(), "no such cluster"))
 			},
 		},
+		{
+			name: "normal proxy with sub-path in endpoint should work",
+			parent: &fakeParentStorage{
+				obj: &ClusterGateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "myName",
+					},
+					Spec: ClusterGatewaySpec{
+						Access: ClusterAccess{
+							Credential: &ClusterAccessCredential{
+								Type:                CredentialTypeServiceAccountToken,
+								ServiceAccountToken: "myToken",
+							},
+						},
+					},
+				},
+			},
+			endpointPath: "/extra",
+			objName:      "myName",
+			inputOption: &ClusterGatewayProxyOptions{
+				Path: "/abc",
+			},
+			reqInfo: request.RequestInfo{
+				Verb: "get",
+			},
+		},
+		{
+			name: "normal proxy with query in endpoint should work",
+			parent: &fakeParentStorage{
+				obj: &ClusterGateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "myName",
+					},
+					Spec: ClusterGatewaySpec{
+						Access: ClusterAccess{
+							Credential: &ClusterAccessCredential{
+								Type:                CredentialTypeServiceAccountToken,
+								ServiceAccountToken: "myToken",
+							},
+						},
+					},
+				},
+			},
+			objName: "myName",
+			inputOption: &ClusterGatewayProxyOptions{
+				Path: "/abc",
+			},
+			query:         "__dryRun=All&fieldValidation=Strict",
+			expectedQuery: "dryRun=All&fieldValidation=Strict",
+			reqInfo: request.RequestInfo{
+				Verb: "get",
+			},
+		},
 	}
 
 	for _, c := range cases {
@@ -86,8 +145,8 @@ func TestProxyHandler(t *testing.T) {
 			text := "ok"
 			var receivingReq *http.Request
 			endpointSvr := httptest.NewTLSServer(http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
-				resp.Write([]byte(text))
 				resp.WriteHeader(200)
+				resp.Write([]byte(text))
 				receivingReq = req
 			}))
 			defer endpointSvr.Close()
@@ -95,7 +154,7 @@ func TestProxyHandler(t *testing.T) {
 				c.parent.obj.Spec.Access.Endpoint = &ClusterEndpoint{
 					Type: ClusterEndpointTypeConst,
 					Const: &ClusterEndpointConst{
-						Address:  endpointSvr.URL,
+						Address:  endpointSvr.URL + c.endpointPath,
 						Insecure: pointer.Bool(true),
 					},
 				}
@@ -118,13 +177,14 @@ func TestProxyHandler(t *testing.T) {
 			defer svr.Close()
 			path := "/foo"
 			targetPath := apiPrefix + c.objName + apiSuffix + path
-			resp, err := svr.Client().Get(svr.URL + targetPath)
+			resp, err := svr.Client().Get(svr.URL + targetPath + "?" + c.query)
 			assert.NoError(t, err)
-			data, err := ioutil.ReadAll(resp.Body)
+			data, err := io.ReadAll(resp.Body)
 			require.NoError(t, err)
 			assert.Equal(t, text, string(data))
 			assert.Equal(t, 200, resp.StatusCode)
-			assert.Equal(t, path, receivingReq.URL.Path)
+			assert.Equal(t, gopath.Join(c.endpointPath, path), receivingReq.URL.Path)
+			assert.Equal(t, c.expectedQuery, receivingReq.URL.RawQuery)
 		})
 	}
 }
@@ -140,6 +200,8 @@ type fakeParentStorage struct {
 func (f *fakeParentStorage) New() runtime.Object {
 	return f.obj
 }
+
+func (f *fakeParentStorage) Destroy() {}
 
 func (f *fakeParentStorage) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
 	return f.obj, f.err
@@ -160,4 +222,41 @@ func (f *fakeResponder) Object(statusCode int, obj runtime.Object) {
 
 func (f *fakeResponder) Error(err error) {
 	f.receivingErr = err
+}
+
+func TestGetImpersonationConfig(t *testing.T) {
+	baseReq, err := http.NewRequest(http.MethodGet, "", nil)
+	require.NoError(t, err)
+	base := context.Background()
+
+	GlobalClusterGatewayProxyConfiguration = &ClusterGatewayProxyConfiguration{
+		Spec: ClusterGatewayProxyConfigurationSpec{
+			ClientIdentityExchanger: ClientIdentityExchanger{Rules: []ClientIdentityExchangeRule{{
+				Name:   "name-matcher",
+				Type:   StaticMappingIdentityExchanger,
+				Source: &IdentityExchangerSource{User: pointer.String("test")},
+				Target: &IdentityExchangerTarget{User: "global"},
+			}}},
+		},
+	}
+
+	h := &proxyHandler{clusterGateway: &ClusterGateway{Spec: ClusterGatewaySpec{ProxyConfig: &ClusterGatewayProxyConfiguration{
+		Spec: ClusterGatewayProxyConfigurationSpec{
+			ClientIdentityExchanger: ClientIdentityExchanger{Rules: []ClientIdentityExchangeRule{{
+				Name:   "group-matcher",
+				Type:   StaticMappingIdentityExchanger,
+				Source: &IdentityExchangerSource{Group: pointer.String("group")},
+				Target: &IdentityExchangerTarget{User: "local"},
+			}}},
+		},
+	}}}}
+
+	ctx := request.WithUser(base, &user.DefaultInfo{Name: "test", Groups: []string{"group"}})
+	require.Equal(t, clientgorest.ImpersonationConfig{UserName: "local"}, h.getImpersonationConfig(baseReq.WithContext(ctx)))
+
+	ctx = request.WithUser(base, &user.DefaultInfo{Name: "test", Groups: []string{"group-test"}})
+	require.Equal(t, clientgorest.ImpersonationConfig{UserName: "global"}, h.getImpersonationConfig(baseReq.WithContext(ctx)))
+
+	ctx = request.WithUser(base, &user.DefaultInfo{Name: "tester", Groups: []string{"group-test"}})
+	require.Equal(t, clientgorest.ImpersonationConfig{UserName: "tester", Groups: []string{"group-test"}}, h.getImpersonationConfig(baseReq.WithContext(ctx)))
 }

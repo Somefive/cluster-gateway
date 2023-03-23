@@ -21,7 +21,7 @@ all: manager
 
 # Run tests
 test: generate fmt vet manifests
-	go test ./pkg/... ./forked/... -coverprofile cover.out
+	go test ./pkg/... -coverprofile cover.out
 
 # Build manager binary
 manager: generate fmt vet
@@ -76,7 +76,7 @@ ifeq (, $(shell which controller-gen))
 	CONTROLLER_GEN_TMP_DIR=$$(mktemp -d) ;\
 	cd $$CONTROLLER_GEN_TMP_DIR ;\
 	go mod init tmp ;\
-	go get sigs.k8s.io/controller-tools/cmd/controller-gen@v0.3.0 ;\
+	go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.3.0 ;\
 	rm -rf $$CONTROLLER_GEN_TMP_DIR ;\
 	}
 CONTROLLER_GEN=$(GOBIN)/controller-gen

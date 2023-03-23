@@ -31,9 +31,25 @@ const (
 	// SecretCache runs a namespaced secret informer inside the apiserver which
 	// provides a cache for reading secret data.
 	SecretCache featuregate.Feature = "SecretCache"
+
+	// owner: @somefive
+	// alpha: v1.4.0
+	//
+	// ClientIdentityPenetration enforce impersonate as the original request user
+	// when accessing apiserver in ManagedCluster
+	ClientIdentityPenetration featuregate.Feature = "ClientIdentityPenetration"
+
+	// owner: @ivan-cai
+	// beta: v1.6.0
+	//
+	// SecretCache runs a OCM ManagedCluster informer inside the apiserver which
+	// provides a cache for reading ManagedCluster.
+	OCMClusterCache featuregate.Feature = "OCMClusterCache"
 )
 
 var DefaultKubeFedFeatureGates = map[featuregate.Feature]featuregate.FeatureSpec{
-	HealthinessCheck: {Default: false, PreRelease: featuregate.Alpha},
-	SecretCache:      {Default: false, PreRelease: featuregate.Alpha},
+	HealthinessCheck:          {Default: false, PreRelease: featuregate.Alpha},
+	SecretCache:               {Default: true, PreRelease: featuregate.Beta},
+	ClientIdentityPenetration: {Default: false, PreRelease: featuregate.Alpha},
+	OCMClusterCache:           {Default: true, PreRelease: featuregate.Beta},
 }

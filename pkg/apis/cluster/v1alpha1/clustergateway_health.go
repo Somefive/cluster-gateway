@@ -29,6 +29,8 @@ func (in *ClusterGatewayHealth) SubResourceName() string {
 	return "health"
 }
 
+func (in *ClusterGatewayHealth) Destroy() {}
+
 func (in *ClusterGatewayHealth) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
 	parentStorage, ok := contextutil.GetParentStorageGetter(ctx)
 	if !ok {
@@ -43,6 +45,10 @@ func (in *ClusterGatewayHealth) Get(ctx context.Context, name string, options *m
 }
 
 func (in *ClusterGatewayHealth) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, forceAllowCreate bool, options *metav1.UpdateOptions) (runtime.Object, bool, error) {
+	if singleton.GetSecretControl() == nil {
+		return nil, false, fmt.Errorf("loopback clients are not inited")
+	}
+
 	latestSecret, err := singleton.GetSecretControl().Get(ctx, name)
 	if err != nil {
 		return nil, false, err

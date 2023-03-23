@@ -1,7 +1,7 @@
 ARG OS=linux
 ARG ARCH=amd64
 # Build the manager binary
-FROM golang:1.17 as builder
+FROM golang:1.19 as builder
 ARG OS
 ARG ARCH
 
@@ -17,7 +17,6 @@ RUN go mod download
 # Copy the go source
 COPY cmd/ cmd/
 COPY pkg/ pkg/
-COPY forked/ forked/
 COPY hack/ hack/
 
 # Build

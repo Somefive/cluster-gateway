@@ -56,9 +56,9 @@ in a local experiment:
 
 |  Bandwidth  |  Direct          |  ClusterGateway  | ClusterGateway(over Konnectivity) |
 |-------------|------------------|------------------|-----------------------------------|
-|  Fastest    |  0.083s          |  0.560s          | 0.556s                            |
-|  Slowest    |  1.078s          |  1.887s          | 2.579s                            |
-|  Average    |  0.580s ± 0.175s |  0.849s ± 0.361s | 1.408s ± 0.542s                   |
+|  Fastest    |  0.059s          |  0.190s          | 0.428s                            |
+|  Slowest    |  0.910s          |  0.856s          | 1.356s                            |
+|  Average    |  0.583s ± 0.104s |  0.581s ± 0.087s | 0.608s ± 0.135s                   |
 
 ### Open-Cluster-Management Integration
 
@@ -119,3 +119,18 @@ to the hosting cluster which is basically responsible for:
 
 The addon-manager can be installed via simple helm commands, please refer to
 the installation guide [here](https://open-cluster-management.io/scenarios/pushing-kube-api-requests/#installation).
+
+### Identity Passing
+
+When feature flag `ClientIdentityPenetration` is enabled, cluster-gateway will 
+recognize the identity in the incoming requests and use the [impersonation mechanism](https://kubernetes.io/docs/reference/access-authn-authz/authentication/#user-impersonation)
+to send requests to managed clusters with identity impersonated. By default,
+the impersonated identity is consistent with the identity in the incoming requests.
+
+In the cases that the identity in different clusters are not aligned, the [ClientIdentityExchanger](https://github.com/oam-dev/cluster-gateway/issues/120)
+feature would be helpful to make projections. You can use either the global configuration
+or the cluster configuration for declaring the identity exchange rules, like the given 
+[example](https://github.com/oam-dev/cluster-gateway/tree/master/examples/client-identity-exchanger/config.yaml).
+For global configuration, you need to set up the `--cluster-gateway-proxy-config=<the configuration file path>`
+to enable it. For cluster configuration, you can set the annotation `cluster.core.oam.dev/cluster-gateway-proxy-configuration`
+value to enable the configuration for the requests to the attached cluster.
